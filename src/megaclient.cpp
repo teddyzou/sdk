@@ -18049,6 +18049,95 @@ string MegaClient::decypherTLVTextWithMasterKey(const char* name, const string& 
     return records ? (*records)[name] : string{};
 }
 
+class MegaClient_internal
+{
+public:
+    static bool trySkipByCheckLocalNodes(MegaClient* client, File* file)
+    {
+        auto nodes = client->mNodeManager.getNodesByFingerprint(file->fingerprint());
+        for (auto node: nodes){
+            if (checkMetaMacWithNode(client, node, file->getLocalname()))
+            {
+                // fast success by just copying to the new node
+                copyByPutnode(client, file, node);
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+private:
+    static bool checkMetaMacWithNode(MegaClient* client
+        , std::shared_ptr<Node> node
+        , const LocalPath& localPath)
+    {
+        
+        if (!node || node->type != FILENODE)
+        {
+            return false;
+        }
+
+        auto ifAccess = client->fsaccess->newfileaccess();
+        if (!ifAccess){
+            return false;
+        }
+
+        if (!ifAccess->fopen(localPath, 1, 0, FSLogging::logOnError))
+        {
+            // cerr << "Failed to open: " << localPath << endl;
+            return false;
+        }
+        
+        SymmCipher cipher;
+        int64_t remoteIv;
+        int64_t remoteMac;
+        
+        std::string remoteKey = node->nodekey();
+
+        // copy from exec_metamac but add this check for security.
+        if (remoteKey.size() <= SymmCipher::KEYLENGTH){
+            return false;
+        }
+
+        const char* iva = &remoteKey[SymmCipher::KEYLENGTH];
+
+        cipher.setkey((byte*)&remoteKey[0], node->type);
+        remoteIv = MemAccess::get<int64_t>(iva);
+        remoteMac = MemAccess::get<int64_t>(iva + sizeof(int64_t));
+
+        // use the remote file cipher to encode the new upload file to metamac
+        auto result = generateMetaMac(cipher, *ifAccess, remoteIv);
+
+        return result.first && result.second == remoteMac;
+    }
+
+    static bool copyByPutnode(MegaClient* client, File* newFile, std::shared_ptr<Node> nodeToClone)
+    {
+        // NodeHandle
+        auto ovHandle = newFile->h; // check ?
+        auto canChange = true; // set true since it is a upload?
+
+        newFile->sendPutnodesToCloneNode(
+            client,
+            nodeToClone.get(),
+            PUTNODES_APP, // PUTNODES_SYNC?
+            ovHandle,
+            [client](const Error& /*e*/,
+                                 targettype_t /*t*/,
+                                 vector<NewNode>& /*nn*/ ,
+                                 bool /*targetOverride*/,
+                                 int /*tag*/,
+                                 const map<string, string>& /*fileHandles*/)
+            {
+               // todo: add complete callback to
+            }, canChange);
+
+        return true;
+    }
+
+};
+
 // inject file into transfer subsystem
 // if file's fingerprint is not valid, it will be obtained from the local file
 // (PUT) or the file's key (GET)
@@ -18146,6 +18235,14 @@ bool MegaClient::startxfer(direction_t d, File* f, TransferDbCommitter& committe
                 memcpy(f->crc.data(), f->filekey, sizeof f->crc);
                 LOG_warn << "Downloading a file with invalid fingerprint, adjusted to: " << f->fingerprintDebugString() << " name: " << f->getLocalname();
             }
+        }
+
+        if (MegaClient_internal::trySkipByCheckLocalNodes(this, f))
+        {
+            // todo: refactor trySkipByCheckLocalNodes to be async
+            // as it is time costing for big files
+            // use f->fcheck to mark the states when refactoring.
+            return true;
         }
 
         Transfer* t = NULL;
@@ -18419,6 +18516,13 @@ void MegaClient::stopxfer(File* f, TransferDbCommitter* committer)
                 transfer->files.front()->prepare(*fsaccess);
             }
         }
+    }
+
+    // only put can be in async checking status, so we donot check for direction
+    if (f->fcheck == File::fast_upload_check::checking)
+    {
+        // todo use compare_exchange
+        f->fcheck = File::fast_upload_check::checkcancelled;
     }
 }
 

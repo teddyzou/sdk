@@ -164,6 +164,17 @@ struct MEGA_API File: public FileFingerprint
     Transfer* transfer;
     file_list::iterator file_it{};
 
+    // for upload, have this file checked for fast upload (from a metamac same remote code)
+    // only valid for a file upload
+    enum class fast_upload_check: uint8_t
+    {
+        None,           // init state
+        checking,       // async checking for big files
+        checkfailed,    // no remote file found for fast upload, continue for a real upload
+        checkcancelled  // user called stopxfer while async checking, so donot continue to create transfer for this file later 
+    };
+    fast_upload_check fcheck{fast_upload_check::None};
+
     File();
     virtual ~File();
 
