@@ -171,6 +171,7 @@ struct MEGA_API File: public FileFingerprint
         None,           // init state
         checking,       // async checking for big files
         checkfailed,    // no remote file found for fast upload, continue for a real upload
+        checkok,        // a remote file found for fast upload and fast upload ok, skip the transfer
         checkcancelled  // user called stopxfer while async checking, so donot continue to create transfer for this file later 
     };
     fast_upload_check fcheck{fast_upload_check::None};

@@ -368,7 +368,7 @@ void File::completed(Transfer* t, putsource_t source)
     assert(!transfer || t == transfer);
     assert(source == PUTNODES_APP);  // derived class for sync doesn't use this code path
 
-    if (t->type == PUT)
+    if (t && t->type == PUT)
     {
         sendPutnodesOfUpload(t->client, t->uploadhandle, *t->ultoken, t->filekey, source, NodeHandle(), nullptr, nullptr, false);
     }
@@ -624,10 +624,17 @@ void SyncUpload_inClient::completed(Transfer* t, putsource_t source)
 {
     // Keep the info required for putnodes and wait for
     // the sync thread to validate and activate the putnodes
-
-    uploadHandle = t->uploadhandle;
-    uploadToken = *t->ultoken;
-    fileNodeKey = t->filekey;
+    if (t){
+        uploadHandle = t->uploadhandle;
+        uploadToken = *t->ultoken;
+        fileNodeKey = t->filekey;
+    }else
+    {
+        // todo: define new semantic, there maybe no uploadToken?
+        // all ultoken logic need to be reviewed
+        // or can we simulate a fake transfer with the copyed node ultoken?(or dose it have)
+    }
+    
 
     SyncTransfer_inClient::completed(t, source);
 }

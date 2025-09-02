@@ -18218,6 +18218,10 @@ public:
             {
                 // fast success by just copying to the new node
                 copyByPutnode(client, file, node);
+
+                // notify to let the app to delete file obj
+                // todo: we may need to call client->file_added too for better compatibility, kind of hello and bye
+                file->completed(nullptr, PUTNODES_APP);
                 return true;
             }
         }

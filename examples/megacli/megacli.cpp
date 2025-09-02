@@ -452,29 +452,38 @@ void AppFilePut::completed(Transfer* t, putsource_t source)
     assert(t->type == PUT);
 
     auto onCompleted_foward = onCompleted;
-    sendPutnodesOfUpload(
-        t->client,
-        t->uploadhandle,
-        *t->ultoken,
-        t->filekey,
-        source,
-        NodeHandle(),
-        [onCompleted_foward](const Error& e,
-                             targettype_t,
-                             vector<NewNode>&,
-                             bool /*targetOverride*/,
-                             int /*tag*/,
-                             const map<string, string>& /*fileHandles*/)
-        {
-            if (e)
+    if (t){
+        sendPutnodesOfUpload(
+            t->client,
+            t->uploadhandle,
+            *t->ultoken,
+            t->filekey,
+            source,
+            NodeHandle(),
+            [onCompleted_foward](const Error& e,
+                                 targettype_t,
+                                 vector<NewNode>&,
+                                 bool /*targetOverride*/,
+                                 int /*tag*/,
+                                 const map<string, string>& /*fileHandles*/)
             {
-                cout << "Putnodes error is breaking upload/download cycle: " << e << endl;
-            }
-            else if (onCompleted_foward)
-                onCompleted_foward();
-        },
-        nullptr,
-        false);
+                if (e)
+                {
+                    cout << "Putnodes error is breaking upload/download cycle: " << e << endl;
+                }
+                else if (onCompleted_foward)
+                    onCompleted_foward();
+            },
+            nullptr,
+            false);
+    }else{
+        // it is a fast upload and there is no transfer
+        // and sendPutnodesToCloneNode is done before callback
+        // todo: 1) add more param to move sendPutnodesToCloneNode here
+        // todo: 2) callback onCompleted only when sendPutnodesToCloneNode finished without e(or call termniate)
+        onCompleted_foward();
+    }
+    
 
     delete this;
 }

@@ -1419,17 +1419,23 @@ void ClientUpload::bound(BoundCallback callback,
 void ClientUpload::completed(Transfer* upload, putsource_t)
 {
     // Sanity.
-    assert(upload);
+    // assert(upload); // upload is null for a fast upload(found same metamac)
 
     // Instantiate bind callback.
-    BindCallback bind = std::bind(&ClientUpload::bind,
-                                  this,
-                                  std::placeholders::_1,
-                                  upload->filekey,
-                                  std::placeholders::_2,
-                                  std::move(mSelf),
-                                  upload->uploadhandle,
-                                  *upload->ultoken);
+    BindCallback bind;
+    if (upload){
+        bind = std::bind(&ClientUpload::bind,
+                         this,
+                         std::placeholders::_1,
+                         upload->filekey,
+                         std::placeholders::_2,
+                         std::move(mSelf),
+                         upload->uploadhandle,
+                         *upload->ultoken);
+    }
+    else{
+        // todo: define the new semantic;
+    }
 
     // Latch callback.
     auto callback = std::move(mCallback);
