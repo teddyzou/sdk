@@ -5213,6 +5213,13 @@ void MegaClient::httprequest(const char *url, int method, bool binary, const cha
     }
 }
 
+void MegaClient::pushPendingScap(pending_scap_t p) {
+
+    mPending_scap.push_back(std::move(p));
+
+    jsonsc.storeobject();
+}
+
 // process server-client request
 bool MegaClient::procsc()
 {
@@ -5225,7 +5232,45 @@ bool MegaClient::procsc()
     CodeCounter::ScopeTimer ccst(performanceStats.scProcessingTime);
     nameid name;
 
-    std::shared_ptr<Node> lastAPDeletedNode;
+
+    // execute the pending action packet first if any cause it is incremental
+    if (insca)
+    {
+        mPending_scap_ctx.start_in_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                            std::chrono::system_clock::now().time_since_epoch()).count();
+
+        while (mPending_scap.size() > 0)
+        {
+            auto ap = mPending_scap.front();
+            if (!ap()){
+                // for element 't', may executed patially; 
+                // do not pop from list if executed patially;
+                return false;
+            }
+            mPending_scap.pop_front();
+
+            // check for timeout
+            if (mPending_scap.size() > 0){
+                auto used_in_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                      std::chrono::system_clock::now().time_since_epoch()).count() -
+                                  mPending_scap_ctx.start_in_ms;
+
+                if (used_in_ms > 100){
+                    // execute partially for timeout
+                    return false;
+                }
+            }
+        }
+
+        // No more Actions Packets. Force it to advance and process all the remaining
+        // command responses until a new "st" is found, if any.
+        // It will also process the latest command response associated (by the Sequence Tag)
+        // with the latest AP processed here.
+        sc_checkSequenceTag(string());
+        // jsonsc.leavearray();
+        insca = false;
+    }
+    
 
     for (;;)
     {
@@ -5486,7 +5531,7 @@ bool MegaClient::procsc()
             if (jsonsc.enterobject())
             {
                 // Check if it is ok to process the current action packet.
-                if (!sc_checkActionPacket(lastAPDeletedNode.get()))
+                if (!sc_checkActionPacket(mPending_scap_ctx.lastAPDeletedNode.get()))
                 {
                     // We can't continue actionpackets until we know the next mCurrentSeqtag to match against, wait for the CS request to deliver it.
                     assert(reqs.cmdsInflight());
@@ -5523,31 +5568,94 @@ bool MegaClient::procsc()
                         switch (name)
                         {
                             case name_id::u:
-                                // node update
-                                sc_updatenode();
+                                pushPendingScap(
+                                    [this, jsonsc_ = jsonsc]
+                                    {
+                                        // node update
+                                        sc_updatenode(jsonsc_);
+                                        return true;
+                                    });
                                 break;
 
                             case makeNameid("t"):
                             {
-                                bool isMoveOperation = false;
-                                // node addition
-                                {
-                                    if (!loggedIntoFolder())
-                                        useralerts.beginNotingSharedNodes();
-                                    handle originatingUser = sc_newnodes(fetchingnodes ? nullptr : lastAPDeletedNode.get(), isMoveOperation);
-                                    mergenewshares(1);
-                                    if (!loggedIntoFolder())
-                                        useralerts.convertNotedSharedNodes(true, originatingUser);
-                                }
-                                lastAPDeletedNode = nullptr;
+                                sc_newnodes_resume_ctx ctx{jsonsc, true, false, false, 0, 
+                                    [](sc_newnodes_resume_ctx& ctx) mutable
+                                    {
+                                        auto used_in_ms =
+                                            std::chrono::duration_cast<std::chrono::milliseconds>(
+                                                std::chrono::system_clock::now().time_since_epoch())
+                                                .count() - ctx.start_in_ms;
+
+                                        ctx.is_pause = used_in_ms > 100;
+                                        return !ctx.is_pause;
+                                    }
+                                }; 
+                                
+                                pushPendingScap(
+                                    [this, ctx = std::move(ctx)] () mutable
+                                    {
+                                        ctx.start_in_ms =
+                                            std::chrono::duration_cast<std::chrono::milliseconds>(
+                                                std::chrono::system_clock::now().time_since_epoch())
+                                                .count();
+                                        ctx.is_pause = false;
+
+                                        // node addition
+                                        if (ctx.is_first)
+                                        {
+                                            if (!loggedIntoFolder())
+                                                useralerts.beginNotingSharedNodes();
+                                        }
+                                            
+                                        handle originatingUser = sc_newnodes(
+                                            ctx,
+                                            fetchingnodes ?
+                                                nullptr :
+                                                mPending_scap_ctx.lastAPDeletedNode.get(),
+                                            ctx.isMoveOperation);
+
+                                        if (!ctx.is_pause){
+                                            mergenewshares(1);
+                                            if (!loggedIntoFolder())
+                                                useralerts.convertNotedSharedNodes(true,
+                                                                                   originatingUser);
+
+                                            mPending_scap_ctx.lastAPDeletedNode = nullptr;
+                                        }
+                                        else{
+                                            // we have big 't' element in sc_newnodes
+                                            // and it paused the execution
+                                            // try resume for the next time
+                                            return false;
+                                        }
+                                        
+                                        return true;
+                                    });
+
+                     
                             }
                             break;
 
                             case name_id::d:
-                                // node deletion
-                                lastAPDeletedNode = sc_deltree();
+                                pushPendingScap(
+                                    [this, jsonsc_ = jsonsc]
+                                    {
+                                        // node deletion
+                                        mPending_scap_ctx.lastAPDeletedNode = sc_deltree(jsonsc_);
+
+                                        return true;
+                                    });
                                 break;
 
+                            /* todo: todo: todo:
+                            * all these cases should be modified as name_id::u and name_id::d
+                            * 1) push the process of the action to the mPending_scap
+                            *       a) capture the jsonsc state to jsonsc_ for later execution
+                            *       b) bypass the jsonsc to skip the current obj (which is done within pushPendingScap )
+                            *       c) add to the process function (like mergenewshares, sc_updatenode) param to use the caputrued jsonsc_ rather than jsonsc
+                            * 
+                            // todo
                             case makeNameid("s"):
                             case makeNameid("s2"):
                                 // share addition/update/revocation
@@ -5560,21 +5668,24 @@ bool MegaClient::procsc()
                                 }
                                 break;
 
+                            // todo
                             case name_id::c:
                                 // contact addition/update
                                 sc_contacts();
                                 break;
 
+                            // todo
                             case makeNameid("fa"):
                                 // file attribute update
                                 sc_fileattr();
                                 break;
 
+                             // todo
                             case makeNameid("ua"):
                                 // user attribute update
                                 sc_userattr();
                                 break;
-
+                                    // todo
                             case name_id::psts:
                             case name_id::psts_v2:
                             case makeNameid("ftr"):
@@ -5584,56 +5695,60 @@ bool MegaClient::procsc()
                                     abortbackoff(true);
                                 }
                                 break;
-
+                                    // todo
                             case name_id::pses:
                                 sc_paymentreminder();
                                 break;
-
+                                    // todo
                             case name_id::ipc:
                                 // incoming pending contact request (to us)
                                 sc_ipc();
                                 break;
-
+                                    // todo
                             case makeNameid("opc"):
                                 // outgoing pending contact request (from us)
                                 sc_opc();
                                 break;
-
+                                    // todo
                             case name_id::upci:
                                 // incoming pending contact request update (accept/deny/ignore)
                                 sc_upc(true);
                                 break;
-
+                                    // todo
                             case name_id::upco:
                                 // outgoing pending contact request update (from them, accept/deny/ignore)
                                 sc_upc(false);
                                 break;
-
+                                    // todo
                             case makeNameid("ph"):
                                 // public links handles
                                 sc_ph();
                                 break;
-
+                                    // todo
                             case makeNameid("se"):
                                 // set email
                                 sc_se();
                                 break;
 #ifdef ENABLE_CHAT
+                               // todo
                             case makeNameid("mcpc"):
                             {
                                 readingPublicChat = true;
                             } // fall-through
+                                // todo
                             case makeNameid("mcc"):
                                 // chat creation / peer's invitation / peer's removal
                                 sc_chatupdate(readingPublicChat);
                                 break;
 
+                                    // todo
                             case makeNameid("mcfpc"): // fall-through
                             case makeNameid("mcfc"):
                                 // chat flags update
                                 sc_chatflags();
                                 break;
 
+                                    // todo
                             case makeNameid("mcpna"): // fall-through
                             case makeNameid("mcna"):
                                 // granted / revoked access to a node
@@ -5645,15 +5760,18 @@ bool MegaClient::procsc()
                                 sc_scheduledmeetings();
                                 break;
 
+                                    // todo
                             case name_id::mcsmr:
                                 // scheduled meetings removal
                                 sc_delscheduledmeeting();
                                 break;
 #endif
+                            // todo
                             case makeNameid("uac"):
                                 sc_uac();
                                 break;
 
+                                    // todo
                             case makeNameid("la"):
                                 // last acknowledged
                                 sc_la();
@@ -5661,56 +5779,57 @@ bool MegaClient::procsc()
 
                             case makeNameid("ub"):
                                 // business account update
-                                sc_ub();
+                                sc_ub();// todo
                                 break;
 
                             case makeNameid("sqac"):
                                 // storage quota allowance changed
-                                sc_sqac();
+                                sc_sqac();// todo
                                 break;
 
                             case makeNameid("asp"):
                                 // new/update of a Set
-                                sc_asp();
+                                sc_asp();// todo
                                 break;
 
                             case makeNameid("ass"):
-                                sc_ass();
+                                sc_ass();// todo
                                 break;
 
                             case makeNameid("asr"):
                                 // removal of a Set
-                                sc_asr();
+                                sc_asr();// todo
                                 break;
 
                             case makeNameid("aep"):
                                 // new/update of a Set Element
-                                sc_aep();
+                                sc_aep();// todo
                                 break;
 
                             case makeNameid("aer"):
                                 // removal of a Set Element
-                                sc_aer();
+                                sc_aer();// todo
                                 break;
                             case makeNameid("pk"):
                                 // pending keys
-                                sc_pk();
+                                sc_pk();// todo
                                 break;
 
                             case makeNameid("uec"):
                                 // User Email Confirm (uec)
-                                sc_uec();
+                                sc_uec();// todo
                                 break;
 
                             case makeNameid("cce"):
                                 // credit card for this user is potentially expiring soon or new card is registered
-                                sc_cce();
+                                sc_cce();// todo
                                 break;
+                             */
                         }
                     }
                     else
                     {
-                        lastAPDeletedNode = nullptr;
+                        mPending_scap_ctx.lastAPDeletedNode = nullptr;
                     }
                 }
 
@@ -5718,6 +5837,13 @@ bool MegaClient::procsc()
             }
             else
             {
+                // all Actions Packets are buffered and delay executed, 
+                // only set insca to false after delay execute is finished
+                // so we break the for loop and pause for now
+                // and begine to execute the delayed actions in the next loop;
+                return false;
+
+                /*
                 // No more Actions Packets. Force it to advance and process all the remaining
                 // command responses until a new "st" is found, if any.
                 // It will also process the latest command response associated (by the Sequence Tag)
@@ -5725,6 +5851,7 @@ bool MegaClient::procsc()
                 sc_checkSequenceTag(string());
                 jsonsc.leavearray();
                 insca = false;
+                */
             }
         }
     }
@@ -6558,7 +6685,7 @@ bool MegaClient::sc_checkActionPacket(Node* lastAPDeletedNode)
 
 
 // server-client node update processing
-void MegaClient::sc_updatenode()
+void MegaClient::sc_updatenode(JSON jsonsc_)
 {
     handle h = UNDEF;
     handle u = 0;
@@ -6567,22 +6694,22 @@ void MegaClient::sc_updatenode()
 
     for (;;)
     {
-        switch (jsonsc.getnameid())
+        switch (jsonsc_.getnameid())
         {
             case makeNameid("n"):
-                h = jsonsc.gethandle();
+                h = jsonsc_.gethandle();
                 break;
 
             case name_id::u:
-                u = jsonsc.gethandle(USERHANDLE);
+                u = jsonsc_.gethandle(USERHANDLE);
                 break;
 
             case makeNameid("at"):
-                a = jsonsc.getvalue();
+                a = jsonsc_.getvalue();
                 break;
 
             case makeNameid("ts"):
-                ts = jsonsc.getint();
+                ts = jsonsc_.getint();
                 break;
 
             case EOO:
@@ -6643,7 +6770,7 @@ void MegaClient::sc_updatenode()
                 return;
 
             default:
-                if (!jsonsc.storeobject())
+                if (!jsonsc_.storeobject())
                 {
                     return;
                 }
@@ -6732,95 +6859,126 @@ CacheableStatus *MegaClient::CacheableStatusMap::getPtr(CacheableStatus::Type ty
 }
 
 // read tree object (nodes and users)
-void MegaClient::readtree(JSON* j, Node* priorActionpacketDeletedNode, bool& firstHandleMatchesDelete)
+void MegaClient::readtree(sc_newnodes_resume_ctx& ctx,
+                          JSON* j,
+                          Node* priorActionpacketDeletedNode,
+                          bool& firstHandleMatchesDelete)
 {
-    if (j->enterobject())
-    {
-        for (;;)
-        {
-            switch (jsonsc.getnameid())
-            {
-                case makeNameid("f"):
-                    if (auto putnodesCmd = dynamic_cast<CommandPutNodes*>(reqs.getCurrentCommand(mCurrentSeqtagSeen)))
-                    {
-                        putnodesCmd->emptyResponse = Utils::startswith(j->pos, "[]");
-                        readnodes(j,
-                                  1,
-                                  putnodesCmd->source,
-                                  &putnodesCmd->nn,
-                                  putnodesCmd->tag != 0,
-                                  true,
-                                  priorActionpacketDeletedNode,
-                                  &firstHandleMatchesDelete);
-                    }
-                    else
-                    {
-                        readnodes(j, 1, PUTNODES_APP, nullptr, false, false, priorActionpacketDeletedNode, &firstHandleMatchesDelete);
-                    }
-                    break;
-
-                case makeNameid("f2"):
-                    if (auto putnodesCmd = dynamic_cast<CommandPutNodes*>(reqs.getCurrentCommand(mCurrentSeqtagSeen)))
-                    {
-                        // new nodes can appear in copied version lists too
-                        readnodes(j,
-                                  1,
-                                  putnodesCmd->source,
-                                  &putnodesCmd->nn,
-                                  putnodesCmd->tag != 0,
-                                  true,
-                                  nullptr,
-                                  nullptr);
-                    }
-                    else
-                    {
-                        readnodes(j, 1, PUTNODES_APP, nullptr, false, false, nullptr, nullptr);
-                    }
-                    break;
-
-                case name_id::u:
-                    readusers(j, true);
-                    break;
-
-                case EOO:
-                    j->leaveobject();
-                    return;
-
-                default:
-                    if (!jsonsc.storeobject())
-                    {
-                        return;
-                    }
-            }
+    if (ctx.is_first){
+        if (!j->enterobject()){
+            // error process?
+            return;
         }
     }
-}
-
-// server-client newnodes processing
-handle MegaClient::sc_newnodes(Node* priorActionpacketDeletedNode, bool& firstHandleMatchesDelete)
-{
-    handle originatingUser = UNDEF;
-    for (;;)
-    {
-        switch (jsonsc.getnameid())
+    
+    
+    for (;;)   {
+        switch (j->getnameid())
         {
-            case makeNameid("t"):
-                readtree(&jsonsc, priorActionpacketDeletedNode, firstHandleMatchesDelete);
+            case makeNameid("f"):
+                if (auto putnodesCmd = dynamic_cast<CommandPutNodes*>(reqs.getCurrentCommand(mCurrentSeqtagSeen)))
+                {
+                    putnodesCmd->emptyResponse = Utils::startswith(j->pos, "[]");
+                    readnodes(j,
+                                1,
+                                putnodesCmd->source,
+                                &putnodesCmd->nn,
+                                putnodesCmd->tag != 0,
+                                true,
+                                priorActionpacketDeletedNode,
+                                &firstHandleMatchesDelete);
+                }
+                else
+                {
+                    readnodes(j, 1, PUTNODES_APP, nullptr, false, false, priorActionpacketDeletedNode, &firstHandleMatchesDelete);
+                }
+                break;
+
+            case makeNameid("f2"):
+                if (auto putnodesCmd = dynamic_cast<CommandPutNodes*>(reqs.getCurrentCommand(mCurrentSeqtagSeen)))
+                {
+                    // new nodes can appear in copied version lists too
+                    readnodes(j,
+                                1,
+                                putnodesCmd->source,
+                                &putnodesCmd->nn,
+                                putnodesCmd->tag != 0,
+                                true,
+                                nullptr,
+                                nullptr);
+                }
+                else
+                {
+                    readnodes(j, 1, PUTNODES_APP, nullptr, false, false, nullptr, nullptr);
+                }
                 break;
 
             case name_id::u:
-                readusers(&jsonsc, true);
+                readusers(j, true);
+                break;
+
+            case EOO:
+                j->leaveobject();
+                return;
+
+            default:
+                if (!j->storeobject())
+                {
+                    return;
+                }
+        }
+
+        if (!ctx.should_continue(ctx)){
+            return;
+        }
+    }
+
+    
+}
+
+// server-client newnodes processing
+handle MegaClient::sc_newnodes(sc_newnodes_resume_ctx& ctx,
+                               Node* priorActionpacketDeletedNode,
+                               bool& firstHandleMatchesDelete)
+{
+    handle originatingUser = UNDEF;
+    JSON& jsonsc_ = ctx.jsonsc;
+    bool pause_processed = false;
+    for (;;)
+    {
+        // check it is a resume from readtree and not resumed yet
+        if (!ctx.is_first &&!pause_processed)
+        {
+            readtree(ctx , &jsonsc_, priorActionpacketDeletedNode, firstHandleMatchesDelete);
+
+            if (ctx.is_pause){
+                return originatingUser;
+            }
+
+            // pause should be resumed only once for every reenter
+            // and resumed to switch case state machine
+            pause_processed = true;
+        }
+
+        switch (jsonsc_.getnameid())
+        {
+            case makeNameid("t"):
+                readtree(ctx, &jsonsc_, priorActionpacketDeletedNode, firstHandleMatchesDelete);
+                break;
+
+            case name_id::u:
+                readusers(&jsonsc_, true);
                 break;
 
             case makeNameid("ou"):
-                originatingUser = jsonsc.gethandle(USERHANDLE);
+                originatingUser = jsonsc_.gethandle(USERHANDLE);
                 break;
 
             case EOO:
                 return originatingUser;
 
             default:
-                if (!jsonsc.storeobject())
+                if (!jsonsc_.storeobject())
                 {
                     return originatingUser;
                 }
@@ -9188,26 +9346,26 @@ shared_ptr<Node> MegaClient::nodeByPath(const char* path, std::shared_ptr<Node> 
 }
 
 // server-client deletion
-std::shared_ptr<Node> MegaClient::sc_deltree()
+std::shared_ptr<Node> MegaClient::sc_deltree(JSON jsonsc_)
 {
     std::shared_ptr<Node> n;
     handle originatingUser = UNDEF;
 
     for (;;)
     {
-        switch (jsonsc.getnameid())
+        switch (jsonsc_.getnameid())
         {
             case makeNameid("n"):
                 handle h;
 
-                if (!ISUNDEF((h = jsonsc.gethandle())))
+                if (!ISUNDEF((h = jsonsc_.gethandle())))
                 {
                     n = nodebyhandle(h);
                 }
                 break;
 
             case makeNameid("ou"):
-                originatingUser = jsonsc.gethandle(USERHANDLE);
+                originatingUser = jsonsc_.gethandle(USERHANDLE);
                 break;
 
             case EOO:
@@ -9245,7 +9403,7 @@ std::shared_ptr<Node> MegaClient::sc_deltree()
                 return n;
 
             default:
-                if (!jsonsc.storeobject())
+                if (!jsonsc_.storeobject())
                 {
                     return NULL;
                 }

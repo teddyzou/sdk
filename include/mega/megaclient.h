@@ -1739,6 +1739,18 @@ private:
     std::unique_ptr<HttpReq> pendingscUserAlerts;
     BackoffTimer btsc;
 
+    // buff the aps, and execute incrementally;
+    using pending_scap_t = std::function<bool(void)>;
+    std::list<pending_scap_t> mPending_scap;
+    // context for the current pendig scap
+    struct
+    {
+        std::chrono::milliseconds::rep start_in_ms;
+        std::shared_ptr<Node> lastAPDeletedNode;
+    } mPending_scap_ctx;
+
+    void pushPendingScap(pending_scap_t p);
+
     int mPendingCatchUps = 0;
     bool mReceivingCatchUp = false;
 
@@ -1842,9 +1854,20 @@ public:
     bool sc_checkSequenceTag(const string& tag);
     bool sc_checkActionPacket(Node* lastAPDeletedNode);
 
-    void sc_updatenode();
-    std::shared_ptr<Node> sc_deltree();
-    handle sc_newnodes(Node* priorActionpacketDeletedNode, bool& firstHandleMismatchedDelete);
+    void sc_updatenode(JSON jsonsc_);
+    std::shared_ptr<Node> sc_deltree(JSON jsonsc_);
+    struct sc_newnodes_resume_ctx {
+        JSON jsonsc;
+        bool is_first;
+        bool is_pause;
+        bool isMoveOperation;
+        std::chrono::milliseconds::rep start_in_ms;
+        std::function<bool(sc_newnodes_resume_ctx& ctx)> should_continue;
+    };
+
+    handle sc_newnodes(sc_newnodes_resume_ctx& ctx, Node* priorActionpacketDeletedNode,
+                       bool& firstHandleMismatchedDelete);
+
     void sc_contacts();
     void sc_fileattr();
     void sc_userattr();
@@ -1886,7 +1909,10 @@ public:
     unsigned addnode(sharedNode_vector* v, std::shared_ptr<Node> n) const;
 
     // read node tree from JSON object
-    void readtree(JSON*, Node* priorActionpacketDeletedNode, bool& firstHandleMatchedDelete);
+    void readtree(sc_newnodes_resume_ctx& ctx,
+                  JSON*,
+                  Node* priorActionpacketDeletedNode,
+                  bool& firstHandleMatchedDelete);
 
     // converts UTF-8 to 32-bit word array
     static char* utf8_to_a32forjs(const char*, int*);
